@@ -1,214 +1,129 @@
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
-import numpy as np
-import sys
 from PIL import Image
-import argparse
+from tqdm import tqdm
 
-from keras.models import Model, load_model
-from keras.layers import multiply, add, Permute, Reshape, Dense, GlobalAveragePooling2D, BatchNormalization, Conv2D, Conv2DTranspose, MaxPooling2D, UpSampling2D, Input, concatenate, Add, Concatenate
-from keras import backend as K
-import tensorflow as tf
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR) # mute deprecation warnings
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from model import BiONet
 
-import keras
-from keras.optimizers import Adam, SGD
-from tensorflow import ConfigProto
-from tensorflow import InteractiveSession
+class ChestXrayMaskDataset(Dataset):
+    def __init__(self, image_dir, mask_dir, transform=None):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+        self.images = sorted(os.listdir(image_dir))
 
-from core import *
-from utils import get_augmented
+    def __len__(self):
+        return len(self.images)
 
-from matplotlib import pyplot as plt
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.image_dir, self.images[idx])
+        mask_path = os.path.join(self.mask_dir, self.images[idx])
 
-def train(args, train_data, val_data):
-  x_train, y_train = train_data[0], train_data[1]
-  x_val, y_val = val_data[0], val_data[1]
+        image = Image.open(img_path).convert("L")
+        mask = Image.open(mask_path).convert("L")
 
-  K.clear_session()
-  config = ConfigProto()
-  config.gpu_options.allow_growth = True
-  session = tf.Session(config=config)
-  K.set_learning_phase(1)
+        if self.transform:
+            image = self.transform(image)
+            mask = self.transform(mask)
 
-  input_shape = x_train[0].shape
+        mask = (mask > 0.5).float()
+        return image, mask
 
-  #create model
-  model = BiONet(
-      input_shape,
-      num_classes=args.num_class,
-      num_layers=4,
-      iterations=args.iter,
-      multiplier=args.multiplier,
-      integrate=args.integrate
-  ).build()
-  
+def dice_loss(pred, target, smooth=1e-4):
+    pred = pred.contiguous()
+    target = target.contiguous()
+    intersection = (pred * target).sum(dim=2).sum(dim=2)
+    loss = 1 - ((2. * intersection + smooth) /
+                (pred.sum(dim=2).sum(dim=2) + target.sum(dim=2).sum(dim=2) + smooth))
+    return loss.mean()
 
-  #augmentation
-  train_gen = get_augmented(
-  x_train, y_train, batch_size=args.batch_size,
-  data_gen_args = dict(
-      rotation_range=15.,
-      width_shift_range=0.05,
-      height_shift_range=0.05,
-      shear_range=50,
-      zoom_range=0.2,
-      horizontal_flip=True,
-      vertical_flip=True,
-      fill_mode='constant'
-  ))
 
-  model.compile(
-      optimizer=Adam(lr=args.lr,decay=args.lr_decay), 
-      loss = 'binary_crossentropy',
-      metrics=[iou, dice_coef]
-  )
+def bce_dice_loss(pred, target):
+    bce = F.binary_cross_entropy(pred, target)
+    dsc = dice_loss(pred, target)
+    return 0.5 * bce + 0.5 * dsc
 
-  print('model successfully built and compiled.')
-  
-  integrate = '_int' if args.integrate else ''
-  weights = '_weights' if args.save_weight else ''
-  cpt_name = 'iter_'+str(args.iter)+'_mul_'+str(args.multiplier)+integrate+'_best'+weights+'.h5'
-  callbacks = [keras.callbacks.ModelCheckpoint("checkpoints/"+args.exp+"/"+cpt_name,monitor='val_iou', mode='max',verbose=0, save_weights_only=args.save_weight, save_best_only=True)]
-  if not os.path.isdir("checkpoints/"+args.exp):
-    os.mkdir("checkpoints/"+args.exp)
-  
-  print('Start training...')
-  history = model.fit_generator(
-      train_gen,
-      steps_per_epoch=args.steps,
-      epochs=args.epochs,
-      validation_data=(x_val, y_val),
-      callbacks=callbacks
-  )
-  print('Training fininshed!')
 
-  K.clear_session()
-  
-  return model
+def dice_coeff(pred, target, smooth=1e-4):
+    pred = (pred > 0.5).float()
+    intersection = (pred * target).sum()
+    return (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
 
-def evaluate(args, valid_data):
-  print('Start evaluation...')
 
-  K.clear_session()
-  K.set_learning_phase(1)
-  config = ConfigProto()
-  config.gpu_options.allow_growth = True
-  session = tf.Session(config=config)
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss = 0
+    for imgs, masks in tqdm(loader, desc="Training", leave=False):
+        imgs, masks = imgs.to(device), masks.to(device)
+        optimizer.zero_grad()
+        outputs = model(imgs)
+        loss = bce_dice_loss(outputs, masks)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
 
-  if args.model_path is None:
-    integrate = '_int' if args.integrate else ''
-    weights = '_weights' if args.save_weight else ''
-    cpt_name = 'iter_'+str(args.iter)+'_mul_'+str(args.multiplier)+integrate+'_best'+weights+'.h5'
-    model_path = "checkpoints/"+args.exp+"/"+cpt_name
-  else:
-    model_path = args.model_path
-  print('Restoring model from path: '+model_path)
 
-  if args.save_weight:
-    model = BiONet(
-          input_shape,
-          num_classes=args.num_class,
-          num_layers=4,
-          iterations=args.iter,
-          multiplier=args.multiplier,
-          integrate=args.integrate
-      ).build().load_weights(model_path)
-  else:
-    model = load_model(model_path, compile=False)
+def validate(model, loader, device):
+    model.eval()
+    total_loss = 0
+    total_dice = 0
+    with torch.no_grad():
+        for imgs, masks in tqdm(loader, desc="Validation", leave=False):
+            imgs, masks = imgs.to(device), masks.to(device)
+            outputs = model(imgs)
+            loss = bce_dice_loss(outputs, masks)
+            dice = dice_coeff(outputs, masks)
+            total_loss += loss.item()
+            total_dice += dice.item()
+    return total_loss / len(loader), total_dice / len(loader)
 
-  model.compile(
-      optimizer=Adam(lr=0.01,decay=4e-6), 
-      loss='binary_crossentropy',
-      metrics=[iou, dice_coef]
-  )
 
-  x, y = valid_data[0], valid_data[1]
-  result = model.evaluate(x,y,batch_size=args.batch_size)
-  print('Validation loss:\t', result[0])
-  print('Validation  iou:\t', result[1])
-  print('Validation dice:\t', result[2])
-
-  print('\nEvaluation finished!')
-
-  if args.save_result:
-
-    # save metrics
-    if not os.path.exists("checkpoints/"+args.exp+"/outputs"):
-      os.mkdir("checkpoints/"+args.exp+"/outputs")
-
-    with open("checkpoints/"+args.exp+"/outputs/result.txt", 'w+') as f:
-      f.write('Validation loss:\t'+str(result[0])+'\n')
-      f.write('Validation  iou:\t'+str(result[1])+'\n')
-      f.write('Validation dice:\t'+str(result[2])+'\n')
-    
-    print('Metrics have been saved to:', "checkpoints/"+args.exp+"/outputs/result.txt")
-
-    # predict and save segmentations
-    results = model.predict(x,batch_size=args.batch_size,verbose=1)
-    results = (results > 0.5).astype(np.float32) # Binarization. Comment out this line if you don't want to
-  
-    print('\nPrediction finished!')
-    print('Saving segmentations...')
-
-    if not os.path.exists("checkpoints/"+args.exp+"/outputs/segmentations"):
-      os.mkdir("checkpoints/"+args.exp+"/outputs/segmentations")
-
-    for i in range(results.shape[0]):
-      plt.imsave("checkpoints/"+args.exp+"/outputs/segmentations/"+str(i)+".png",results[i,:,:,0],cmap='gray') # binary segmenation
-
-    print('A total of '+str(results.shape[0])+' segmentation results have been saved to:', "checkpoints/"+args.exp+"/outputs/segmentations/")
-
-  K.clear_session()
-  
 def main():
-    parser = argparse.ArgumentParser(description='BiO-Net')
-    parser.add_argument('--epochs', default=300, type=int, help='trining epochs')
-    parser.add_argument('--batch_size', default=2, type=int, help='batch size')
-    parser.add_argument('--steps', default=250, type=int, help='steps per epoch')
-    parser.add_argument('--lr', default=0.01, type=float, help='learning rate')
-    parser.add_argument('--lr_decay', default=3e-5, type=float, help='learning rate decay')
-    parser.add_argument('--num_class', default=1, type=int, help='model output channel number')
-    parser.add_argument('--multiplier', default=1.0, type=float, help='parameter multiplier')
-    parser.add_argument('--iter', default=1, type=int, help='recurrent iteration')
-    parser.add_argument('--integrate', action='store_true', help='integrate all inferenced features')
-    parser.add_argument('--save_weight', action='store_true', help='save weight only')
-    parser.add_argument('--train_data', default='./data/train', type=str, help='data path')
-    parser.add_argument('--valid_data', default='./data/valid', type=str, help='data path')
-    parser.add_argument('--exp', default='1', type=str, help='experiment number')
-    parser.add_argument('--evaluate_only', action='store_true', help='evaluate only?')
-    parser.add_argument('--save_result', action='store_true', default=False, help='save results to exp folder?')
-    parser.add_argument('--model_path', default=None, type=str, help='path to model check')
-    args = parser.parse_args()
+    train_img_dir = r"data\train_data\images"
+    train_mask_dir = r"data\train_data\masks"
+    val_img_dir = r"data\valid_data\images"
+    val_mask_dir = r"data\valid_data\masks"
 
-    print()
-    print()
-    print(args) # print command line arguments
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+    ])
 
-    # path verification
-    if args.model_path is not None:
-      if os.path.isfile(args.output_path):
-        print('Model path has been verified.')
-      else:
-        print('Invalid model path! Please specify a valid model file. Program terminating...')
-        exit()
+    train_dataset = ChestXrayMaskDataset(train_img_dir, train_mask_dir, transform)
+    val_dataset = ChestXrayMaskDataset(val_img_dir, val_mask_dir, transform)
 
-    valid_x, valid_y = load_data(args.valid_data, 'monuseg')
-    # valid_x, valid_y = load_data(args.valid_data, 'tnbc')
-    # uncomment above to validate with tnbc,
-    # NOTE: tnbc data path must be specified in --valid_data
-    val_data = [valid_x,valid_y]
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2)
 
-    if not args.evaluate_only:
-      train_x, train_y = load_data(args.train_data, 'monuseg')
-      train_data = [train_x, train_y]
-      print('data loading finish')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-      train(args,train_data,val_data)
+    model = BiONet(num_classes=1, iterations=2, num_layers=4, integrate=False).to(device)
 
-    evaluate(args, val_data)
-    
-if __name__ == '__main__':
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    best_val_dice = 0.0
+    num_epochs = 50
+    save_path = "bionet_chestxray_best.pth"
+
+    for epoch in range(1, num_epochs + 1):
+        print(f"\nEpoch [{epoch}/{num_epochs}]")
+        train_loss = train_one_epoch(model, train_loader, optimizer, device)
+        val_loss, val_dice = validate(model, val_loader, device)
+
+        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Dice: {val_dice:.4f}")
+
+        if val_dice > best_val_dice:
+            best_val_dice = val_dice
+            torch.save(model.state_dict(), save_path)
+            print(f"Saved best model (Dice: {val_dice:.4f})")
+
+    print(f"\nTraining complete. Best Dice: {best_val_dice:.4f}")
+
+
+if __name__ == "__main__":
     main()
-  
