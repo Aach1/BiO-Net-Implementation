@@ -1,4 +1,4 @@
-Implementation of BiO-Net model from "BiO-Net: Learning Recurrent Bi-directional Connections for Encoder-Decoder Architecture", MICCAI 2020
+#Implementation of BiO-Net model from "BiO-Net: Learning Recurrent Bi-directional Connections for Encoder-Decoder Architecture", MICCAI 2020
 Adapted for Chest X-Ray Dataset by Nikhil Pandey from Kaggle.
 
 Official Paper: https://arxiv.org/abs/2007.00243
