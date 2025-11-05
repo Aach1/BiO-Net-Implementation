@@ -1,15 +1,14 @@
 # data preprocessing pipeline for Nikhil Pandey’s Chest X-ray Masks and Labels
-
 import os
 import glob
 from PIL import Image
 from sklearn.model_selection import train_test_split
 
-ROOT = r"file/path"
+ROOT = r"file\path"
 IMG_DIR = os.path.join(ROOT, "CXR_png")
 MASK_DIR = os.path.join(ROOT, "masks")
 
-OUT_ROOT = r"C:\Users\Aachi\Downloads\bionet_lung"
+OUT_ROOT = r"output\path"
 TRAIN_IMG_OUT = os.path.join(OUT_ROOT, "train_data", "images")
 TRAIN_MASK_OUT = os.path.join(OUT_ROOT, "train_data", "masks")
 VAL_IMG_OUT = os.path.join(OUT_ROOT, "valid_data", "images")
@@ -69,5 +68,4 @@ def save_pairs(pairs, out_img_dir, out_mask_dir, subset_name):
 save_pairs(train_pairs, TRAIN_IMG_OUT, TRAIN_MASK_OUT, "Train")
 save_pairs(val_pairs, VAL_IMG_OUT, VAL_MASK_OUT, "Validation")
 
-print("\nPreprocessing complete!")
-print(f"Data ready at: {OUT_ROOT}")
+print("\nPreprocessing complete")
